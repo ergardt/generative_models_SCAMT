@@ -24,7 +24,7 @@ def train(data_path, model_path, bs, lr, epochs, device):
 
 def parameter():
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument('--function', type=str, default='generation', choices=['generation', 'training'])
+    parser.add_argument('--mode', type=str, default='generation', choices=['generation', 'training'])
     parser.add_argument('--data_path', type=str, default='../data/database_ChEMBL.csv')
     parser.add_argument('--model_path', type=str, default='checkpoints/gan_mol.pkl')
     parser.add_argument('--molecules_path', type=str, default='results/generated_molecules_gan.csv')
@@ -34,10 +34,10 @@ def parameter():
     parser.add_argument('--num_molecules', type=int, default=1000)
     return parser.parse_args()
 
-if __name__ == "__main__":
+def main():
     args = vars(parameter())
     device = 'cuda' if torch.cuda.is_available() is False else 'cpu'
-    function = args['function']
+    mode = args['mode']
     data_path = args['data_path']
     model_path = args['model_path']
     molecules_path = args['molecules_path']
@@ -51,3 +51,6 @@ if __name__ == "__main__":
     
     if function == 'generation':
         generate(num_molecules, model_path, molecules_path)
+
+if __name__ == "__main__":
+    main()
