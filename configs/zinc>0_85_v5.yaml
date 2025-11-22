@@ -1,0 +1,14 @@
+data_path: ./data/smiles_QED>0_85.csv
+model_path: checkpoints/gan_mol_zinc_v5.pkl
+molecules_path: results/generated_molecules_gan_zinc_v5.csv
+bs: 512
+lr_optim: 0.001
+lr_discr: 0.0001
+epochs: 10
+num_molecules: 2000
+log_path: ./molgen_logs/zinc_v5
+label_smoothing: True
+label_smoothing_params: (0, 0.1)
+num_gen_iterations: 10
+reward_clamp: True
+update_baseline_weights: (0.99, 0.01)

@@ -8,6 +8,8 @@ import torch.utils.data as torch_data
 from torch.distributions import Categorical
 from torch.nn.utils import clip_grad_value_
 from torch.utils.data import DataLoader
+import matplotlib.pyplot as plt
+import os
 
 from scripts.layers import Generator, RecurrentDiscriminator
 from scripts.tokenizer import Tokenizer
@@ -15,7 +17,19 @@ from scripts.tokenizer import Tokenizer
 
 class MolGen(nn.Module):
 
-    def __init__(self, data, hidden_dim=128, lr=1e-3, device='cpu'):
+    def __init__(self, 
+                 data, 
+                 hidden_dim=128, 
+                 lr_optim=1e-3, 
+                 lr_discr=1e-3, 
+                 log_path =  './molgen_logs/tmp',
+                 label_smoothing = False,
+                 label_smoothing_params = [0, 1],
+                 num_gen_iterations = 1,
+                 reward_clamp = False,
+                 update_baseline_weights = [0.9, 0.1],
+                 device='cpu'
+                 ):
         """[summary]
 
         Args:
@@ -47,12 +61,26 @@ class MolGen(nn.Module):
         ).to(device)
 
         self.generator_optim = torch.optim.Adam(
-            self.generator.parameters(), lr=lr)
-
+            self.generator.parameters(), lr=lr_optim)
+        
         self.discriminator_optim = torch.optim.Adam(
-            self.discriminator.parameters(), lr=lr)
+            self.discriminator.parameters(), lr=lr_discr)
 
         self.b = 0.  # baseline reward
+        self.log_path = log_path
+        os.makedirs(self.log_path, exist_ok=True)
+        self.history = {'step': [], 'loss_disc': [], 'loss_gen': [], 'mean_reward': []}
+        self.global_step = 0
+        self.num_gen_iterations =  num_gen_iterations
+        self.label_smoothing = label_smoothing
+        self.label_smoothing_params = label_smoothing_params
+        print("DEBUG: label_smoothing_params =", self.label_smoothing_params)
+        print("DEBUG: type =", type(self.label_smoothing_params))
+        print("DEBUG: len =", len(self.label_smoothing_params) if hasattr(self.label_smoothing_params, '__len__') else 'N/A')
+        self.reward_clamp = reward_clamp
+        self.update_baseline_weights = update_baseline_weights
+        
+
 
     def sample_latent(self, batch_size):
         """Sample from latent space
@@ -80,99 +108,89 @@ class MolGen(nn.Module):
         y_pred, mask = self.discriminator(x).values()
 
         loss = F.binary_cross_entropy(
-            y_pred, y, reduction='none') * mask
+            y_pred, y.float(), reduction='none') * mask
 
         loss = loss.sum() / mask.sum()
 
         return loss
 
     def train_step(self, x):
-        """One training step
-
-        Args:
-            x (torch.LongTensor): sample form real distribution
-        """
+        """One training step with built-in logging and plotting."""
 
         batch_size, len_real = x.size()
-        #print(self.device)
-        # create real and fake labels
         x_real = x.to(self.device)
-        y_real = torch.ones(batch_size, len_real).to(self.device)
+        if self.label_smoothing:
+            y_real = torch.full((batch_size, len_real), self.label_smoothing_params[1], device=self.device)
+        else:
+            y_real = torch.ones(batch_size, len_real).to(self.device)
 
-        # sample latent var
-        z = self.sample_latent(batch_size)
-        generator_outputs = self.generator.forward(z, max_len=100)
-        x_gen, log_probs, entropies = generator_outputs.values()
 
-        # label for fake data
-        _, len_gen = x_gen.size()
-        y_gen = torch.zeros(batch_size, len_gen).to(self.device)
+        for i in range(self.num_gen_iterations):
+            z = self.sample_latent(batch_size)
+            generator_outputs = self.generator.forward(z, max_len=100)
+            x_gen, log_probs, entropies = generator_outputs.values()
 
-        #####################
-        # Train Discriminator
-        #####################
 
-        self.discriminator_optim.zero_grad()
+            # НОВАЯ СТРОЧКА  
+            # x_gen_for_disc = torch.where(x_gen == -1, torch.zeros_like(x_gen), x_gen)
 
-        # disc fake loss
-        fake_loss = self.discriminator_loss(x_gen, y_gen)
+            _, len_gen = x_gen.size()
+            if self.label_smoothing:
+                y_gen = torch.full((batch_size, len_gen), self.label_smoothing_params[0], device=self.device)
+            else:
+                y_gen = torch.zeros(batch_size, len_gen).to(self.device)
 
-        # disc real loss
-        real_loss = self.discriminator_loss(x_real, y_real)
+            #####################
+            # Train Discriminator
+            #####################
+            if i==0:
+                self.discriminator_optim.zero_grad()
+                fake_loss = self.discriminator_loss(x_gen, y_gen)
+                # fake_loss = self.discriminator_loss(x_gen_for_disc, y_gen)
+                real_loss = self.discriminator_loss(x_real, y_real)
+                discr_loss = 0.5 * (real_loss + fake_loss)
+                discr_loss.backward()
+                clip_grad_value_(self.discriminator.parameters(), 0.1)
+                self.discriminator_optim.step()
 
-        # combined loss
-        discr_loss = 0.5 * (real_loss + fake_loss)
-        discr_loss.backward()
-        print('discr_loss',discr_loss.cpu().detach().numpy())
-        # clip grad
-        clip_grad_value_(self.discriminator.parameters(), 0.1)
+            #################
+            # Train Generator
+            #################
+            self.generator_optim.zero_grad()
+            y_pred, y_pred_mask = self.discriminator(x_gen).values()
+            # y_pred, y_pred_mask = self.discriminator(x_gen_for_disc).values()
+            if self.reward_clamp:
+                R = torch.clamp(2 * y_pred - 1, min=-0.9, max=0.9)
+            else:
+                 R = (2 * y_pred - 1)
+            lengths = y_pred_mask.sum(1).long()
+            list_rewards = [rw[:ln] for rw, ln in zip(R, lengths)]
 
-        # update params
-        self.discriminator_optim.step()
+            generator_loss = []
+            for reward, log_p in zip(list_rewards, log_probs):
+                reward_baseline = reward - self.b
+                generator_loss.append((- reward_baseline * log_p).sum())
 
-        # ###############
-        # Train Generator
-        # ###############
+            generator_loss = torch.stack(generator_loss).mean() - sum(entropies) * 0.01 / batch_size
+            generator_loss.backward()
+            clip_grad_value_(self.generator.parameters(), 0.1)
+            self.generator_optim.step()
 
-        self.generator_optim.zero_grad()
+            # Update baseline
+            with torch.no_grad():
+                mean_reward = (R * y_pred_mask).sum() / y_pred_mask.sum()
+                self.b = self.update_baseline_weights[0] * self.b + self.update_baseline_weights[1] * mean_reward  # <<< медленнее!
 
-        # prediction for generated x
-        y_pred, y_pred_mask = self.discriminator(x_gen).values()
+            # Save metrics
+            loss_disc_val = discr_loss.item()
+            loss_gen_val = generator_loss.item()
+            mean_reward_val = mean_reward.item()
 
-        # Reward (see the ref paper)
-        R = (2 * y_pred - 1)
-
-        # reward len for each sequence
-        lengths = y_pred_mask.sum(1).long()
-
-        # list of rew of each sequences
-        list_rewards = [rw[:ln] for rw, ln in zip(R, lengths)]
-
-        # compute - (r - b) log x
-        generator_loss = []
-        for reward, log_p in zip(list_rewards, log_probs):
-
-            # substract the baseline
-            reward_baseline = reward - self.b
-
-            generator_loss.append((- reward_baseline * log_p).sum())
-
-        # mean loss + entropy reg
-        generator_loss = torch.stack(generator_loss).mean() - \
-            sum(entropies) * 0.01 / batch_size
-        print('generator_los', generator_loss.cpu().detach().numpy())
-        # baseline moving average
-        with torch.no_grad():
-            mean_reward = (R * y_pred_mask).sum() / y_pred_mask.sum()
-            self.b = 0.9 * self.b + (1 - 0.9) * mean_reward
-
-        generator_loss.backward()
-
-        clip_grad_value_(self.generator.parameters(), 0.1)
-
-        self.generator_optim.step()
-
-        return {'loss_disc': discr_loss.item(), 'mean_reward': mean_reward}
+        return {
+            'loss_disc': loss_disc_val,
+            'loss_gen': loss_gen_val, 
+            'mean_reward': mean_reward_val
+        }
 
     def create_dataloader(self, data, batch_size=128, shuffle=True, num_workers=5):
         """create a dataloader
@@ -195,75 +213,60 @@ class MolGen(nn.Module):
             num_workers=num_workers
         )
 
-    # def train_n_steps(self, train_loader, max_step=10000, evaluate_every=50):
-    #     """Train for max_step steps
-    #
-    #     Args:
-    #         train_loader (torch.data.DataLoader): dataloader
-    #         max_step (int, optional): Defaults to 10000.
-    #         evaluate_every (int, optional): Defaults to 50.
-    #     """
-    #
-    #     iter_loader = iter(train_loader)
-    #
-    #     # best_score = 0.0
-    #     for step in range(max_step):
-    #         print('Step is',step)
-    #
-    #         try:
-    #             batch = next(iter_loader)
-    #         except:
-    #             iter_loader = iter(train_loader)
-    #             batch = next(iter_loader)
-    #
-    #         # model update
-    #         self.train_step(batch)
-    #
-    #         if step % evaluate_every == 0:
-    #
-    #             self.eval()
-    #             score = self.evaluate_n(100)
-    #             self.train()
-    #
-    #             # if score > best_score:
-    #             #     self.save_best()
-    #             #     print('saving')
-    #             #     best_score = score
-    #
-    #             print(f'valid = {score: .2f}')
     def train_n_steps(self, train_loader, max_epoch=10000, evaluate_every=50):
-
-        #iter_loader = iter(train_loader)
-
-        # best_score = 0.0
         for epoch in range(max_epoch):
-            print('#'*12,f'Epoch:{epoch}','#'*12,sep='\n')
+            print('#' * 12, f'Epoch: {epoch}', '#' * 12, sep='\n')
+            
+            epoch_metrics = {'loss_disc': [], 'loss_gen': [], 'mean_reward': []}
+            
             for i, batch in enumerate(train_loader):
-                print('Batch #',i)
-        # for step in range(max_step):
-        #     print('Step is',step)
-        #
-        #     try:
-        #         batch = next(iter_loader)
-        #     except:
-        #         iter_loader = iter(train_loader)
-        #         batch = next(iter_loader)
+                print('Batch #', i)
+                metrics = self.train_step(batch)
+                self.global_step += 1
 
-            # model update
-                self.train_step(batch)
+                # Сохраняем метрики каждого шага (опционально)
+                self.history['step'].append(self.global_step)
+                self.history['loss_disc'].append(metrics['loss_disc'])
+                self.history['loss_gen'].append(metrics['loss_gen'])
+                self.history['mean_reward'].append(metrics['mean_reward'])
 
+
+                # Оценка каждые N батчей
                 if i % evaluate_every == 0:
-
                     self.eval()
                     score = self.evaluate_n(100)
                     self.train()
+                    print(f'Valid = {score:.2f}')
 
-                    # if score > best_score:
-                    #     self.save_best()
-                    #     print('saving')
-                    #     best_score = score
+                log_file = os.path.join(self.log_path, "training_log.csv")
+                pd.DataFrame(self.history).to_csv(log_file, index=False)
+                # Отрисовка графиков
+                plt.figure(figsize=(12, 4))
+                for idx, (key, title) in enumerate([
+                    ('loss_disc', 'Discriminator Loss'),
+                    ('loss_gen', 'Generator Loss'),
+                    ('mean_reward', 'Mean Reward')
+                ], 1):
+                    plt.subplot(1, 3, idx)
+                    plt.plot(self.history['step'], self.history[key])
+                    plt.title(title)
+                    plt.xlabel('Step')
+                    if key != 'mean_reward':
+                        plt.ylim(-1, 1)
+                    plt.grid(True)
+                plt.tight_layout()
+                plt.savefig(os.path.join(self.log_path, "losses.png"))
+                plt.close()
 
-                    print(f'valid = {score: .2f}')
+                
+            
+
+            # === Конец эпохи: сохранение и отрисовка ===
+
+
+            
+            print(f"Epoch {epoch} completed. Plot and log saved.")
+    
 
     def get_mapped(self, seq):
         """Transform a sequence of ids to string
@@ -290,6 +293,10 @@ class MolGen(nn.Module):
         z = torch.randn((n, self.hidden_dim)).to(self.device)
 
         x = self.generator(z)['x'].cpu()
+
+        # НОВАЯ СТРОЧКА
+        # x = torch.where(x == -1, torch.zeros_like(x), x) 
+
         #pd.DataFrame
         lenghts = (x > 0).sum(1)
 
