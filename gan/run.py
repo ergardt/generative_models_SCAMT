@@ -24,6 +24,9 @@ def train(data_path,
            num_gen_iterations,
            reward_clamp,
            update_baseline_weights,
+           entropy_weight,
+           gen_clip_grad_value,
+           add_validity,
            epochs, 
            device):
     print('load data...')
@@ -44,6 +47,9 @@ def train(data_path,
                     num_gen_iterations = num_gen_iterations,
                     reward_clamp = reward_clamp,
                     update_baseline_weights = update_baseline_weights,
+                    entropy_weight=entropy_weight,
+                    gen_clip_grad_value=gen_clip_grad_value,
+                    add_validity=add_validity,
                      device=device)
     loader = gan_mol.create_dataloader(data, batch_size=bs, shuffle=True, num_workers=1)
     gan_mol.train_n_steps(loader, max_epoch=epochs, evaluate_every=50)
@@ -120,22 +126,29 @@ def main():
     num_gen_iterations = args['num_gen_iterations']
     reward_clamp = args['reward_clamp']
     update_baseline_weights = args['update_baseline_weights']
+    entropy_weight = args['entropy_weight']
+    gen_clip_grad_value = args['gen_clip_grad_value']
+    add_validity=args['add_validity']
 
     if mode == 'training':
         print(f"Запуск обучения на устройстве: {device}")
-        train(data_path,
-               model_path,
-                 bs, 
-                 lr_optim,
-                   lr_discr, 
-                   log_path = log_path,
-                   label_smoothing = label_smoothing,
-                   label_smoothing_params = label_smoothing_params,
-                   num_gen_iterations = num_gen_iterations,
-                   reward_clamp = reward_clamp,
-                    update_baseline_weights=  update_baseline_weights,
-                   epochs=epochs, 
-                   device=device)
+        train(
+            data_path,
+            model_path,
+            bs, 
+            lr_optim,
+            lr_discr, 
+            log_path = log_path,
+            label_smoothing = label_smoothing,
+            label_smoothing_params = label_smoothing_params,
+            num_gen_iterations = num_gen_iterations,
+            reward_clamp = reward_clamp,
+            update_baseline_weights=  update_baseline_weights,
+            entropy_weight=entropy_weight,
+            gen_clip_grad_value=gen_clip_grad_value,
+            add_validity=add_validity,
+            epochs=epochs, 
+            device=device)
     
     if mode == 'generation':
         generate(num_molecules, model_path, molecules_path)

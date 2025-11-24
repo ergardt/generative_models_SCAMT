@@ -28,6 +28,9 @@ class MolGen(nn.Module):
                  num_gen_iterations = 1,
                  reward_clamp = False,
                  update_baseline_weights = [0.9, 0.1],
+                 entropy_weight = 0.01,
+                 gen_clip_grad_value=0.1,
+                 add_validity=False,
                  device='cpu'
                  ):
         """[summary]
@@ -79,6 +82,9 @@ class MolGen(nn.Module):
         print("DEBUG: len =", len(self.label_smoothing_params) if hasattr(self.label_smoothing_params, '__len__') else 'N/A')
         self.reward_clamp = reward_clamp
         self.update_baseline_weights = update_baseline_weights
+        self.entropy_weight = entropy_weight
+        self.gen_clip_grad_value = gen_clip_grad_value
+        self.add_validity=add_validity
         
 
 
@@ -158,11 +164,30 @@ class MolGen(nn.Module):
             #################
             self.generator_optim.zero_grad()
             y_pred, y_pred_mask = self.discriminator(x_gen).values()
+            lengths = y_pred_mask.sum(1).long()
+            smiles_list = [self.get_mapped(x_i[:l-1].numpy()) for x_i, l in zip(x_gen.cpu(), lengths)]
+            
             # y_pred, y_pred_mask = self.discriminator(x_gen_for_disc).values()
             if self.reward_clamp:
                 R = torch.clamp(2 * y_pred - 1, min=-0.9, max=0.9)
             else:
                  R = (2 * y_pred - 1)
+
+            if self.add_validity:
+                
+                validity_rewards = []
+                for smi in smiles_list:
+                    try:
+                        mol = Chem.MolFromSmiles(smi)
+                        if mol is not None:
+                            validity_rewards.append(1.0)
+                        else:
+                            validity_rewards.append(0.0)
+                    except:
+                        validity_rewards.append(0.0)
+                validity_rewards = torch.tensor(validity_rewards, device=R.device).unsqueeze(1)
+                R = 0.5 * R + 0.5 * validity_rewards
+
             lengths = y_pred_mask.sum(1).long()
             list_rewards = [rw[:ln] for rw, ln in zip(R, lengths)]
 
@@ -171,9 +196,9 @@ class MolGen(nn.Module):
                 reward_baseline = reward - self.b
                 generator_loss.append((- reward_baseline * log_p).sum())
 
-            generator_loss = torch.stack(generator_loss).mean() - sum(entropies) * 0.01 / batch_size
+            generator_loss = torch.stack(generator_loss).mean() - sum(entropies) * self.entropy_weight / batch_size
             generator_loss.backward()
-            clip_grad_value_(self.generator.parameters(), 0.1)
+            clip_grad_value_(self.generator.parameters(), self.gen_clip_grad_value)
             self.generator_optim.step()
 
             # Update baseline
@@ -185,6 +210,10 @@ class MolGen(nn.Module):
             loss_disc_val = discr_loss.item()
             loss_gen_val = generator_loss.item()
             mean_reward_val = mean_reward.item()
+
+        print("Generated SMILES:")
+        for i in range(min(5, len(smiles_list))):
+            print(f"{i+1}: {smiles_list[i]}")
 
         return {
             'loss_disc': loss_disc_val,
@@ -242,16 +271,17 @@ class MolGen(nn.Module):
                 pd.DataFrame(self.history).to_csv(log_file, index=False)
                 # Отрисовка графиков
                 plt.figure(figsize=(12, 4))
-                for idx, (key, title) in enumerate([
-                    ('loss_disc', 'Discriminator Loss'),
-                    ('loss_gen', 'Generator Loss'),
-                    ('mean_reward', 'Mean Reward')
+                for idx, (key, title, scale) in enumerate([
+                    ('loss_disc', 'Discriminator Loss (scaled)', True),
+                    ('loss_gen', 'Generator Loss (scaled)', True),
+                    ('loss_gen', 'Generator Loss', False),
+                    ('mean_reward', 'Mean Reward', False)
                 ], 1):
-                    plt.subplot(1, 3, idx)
+                    plt.subplot(1, 4, idx)
                     plt.plot(self.history['step'], self.history[key])
                     plt.title(title)
                     plt.xlabel('Step')
-                    if key != 'mean_reward':
+                    if scale:
                         plt.ylim(-1, 1)
                     plt.grid(True)
                 plt.tight_layout()

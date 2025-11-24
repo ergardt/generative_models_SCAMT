@@ -23,6 +23,7 @@ class Generator(nn.Module):
         self.vocab_size = vocab_size
         self.start_token = start_token
         self.end_token = end_token
+        self.latent_dim = latent_dim
 
         self.embedding_layer = nn.Embedding(self.vocab_size, latent_dim)
 
@@ -41,7 +42,8 @@ class Generator(nn.Module):
             nn.ELU(alpha=0.1),
             nn.Dropout(0.1),
         )
-        self.rnn = nn.LSTMCell(latent_dim, latent_dim)
+        # self.rnn = nn.LSTMCell(latent_dim, latent_dim)
+        self.rnn = nn.LSTM(latent_dim, latent_dim, num_layers=2, batch_first=True)
         self.output_layer = nn.Sequential(
             nn.ReLU(),
             nn.Dropout(0.1),
@@ -75,15 +77,29 @@ class Generator(nn.Module):
         log_probabilities = []
         entropies = []
 
-        h, c = self.project(z).chunk(2, dim=1)
+        # h, c = self.project(z).chunk(2, dim=1)
+
+        hc = self.project(z)
+        h0 = torch.zeros(2, batch_size, self.latent_dim).to(z.device)
+        c0 = torch.zeros(2, batch_size, self.latent_dim).to(z.device)
+        h0[0] = hc[:, :self.latent_dim]
+        c0[0] = hc[:, self.latent_dim:]
+        current_token = torch.full((batch_size,), self.start_token, device=z.device).long()
+        h, c = h0, c0
+
+
 
         for i in range(max_len):
 
+            emb = self.embedding_layer(current_token).unsqueeze(1)  # [B, 1, latent_dim]
+            output, (h, c) = self.rnn(emb, (h, c))
+
             # new state
-            h, c = self.rnn(emb, (h, c))
+            # h, c = self.rnn(emb, (h, c))
 
             # prediction
-            logits = self.output_layer(h)
+            # logits = self.output_layer(h)
+            logits = self.output_layer(output.squeeze(1))
 
             # create dist
             dist = Categorical(logits=logits)
@@ -101,7 +117,8 @@ class Generator(nn.Module):
             entropies.append(dist.entropy())
 
             # new embedding
-            emb = self.embedding_layer(sample)
+            # emb = self.embedding_layer(sample)
+            current_token = sample
 
         # stack along sequence dim
         x = torch.stack(x, dim=1)
