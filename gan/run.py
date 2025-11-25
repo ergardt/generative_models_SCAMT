@@ -6,6 +6,8 @@ import pandas as pd
 import ast
 import argparse
 from scripts.model import MolGen
+from scripts.tokenizer import Tokenizer
+
 
 def generate(num_molecules, model_path, molecules_path):
     gan_mol = pi.load(open(model_path, 'rb'))
@@ -29,6 +31,26 @@ def train(data_path,
            add_validity,
            epochs, 
            device):
+    # with open(data_path) as f:
+    #     data = f.read().strip().split('\n')
+
+    # print("=== Tokenizer Debug ===")
+    # tokenizer = Tokenizer(data)
+    # print("Vocab size:", tokenizer.vocab_size)
+    # print("Mapping:", tokenizer.mapping)
+    # print("Inv mapping:", tokenizer.inv_mapping)
+
+    # # Пример токенизации
+    # sample_smiles = data[0]
+    # encoded = tokenizer.encode_smile(sample_smiles)  # это torch.Tensor
+    # print(f"Encoded:  {encoded}")
+
+    # # Декодируем: преобразуем тензоры в int
+    # decoded = ''.join(tokenizer.inv_mapping[int(i)] for i in encoded[:-1])  # без <eos>
+    # print(f"Original: {sample_smiles}")
+    # print(f"Decoded:  {decoded}")
+    # assert sample_smiles == decoded, "Tokenizer mismatch!"
+
     print('load data...')
     data = []
     with open(data_path, "r") as f:
@@ -38,10 +60,10 @@ def train(data_path,
 
     print('training model...')
     gan_mol = MolGen(data, 
-                     hidden_dim=128, 
-                     lr_optim=lr_optim, 
-                     lr_discr=lr_discr, 
-                     log_path =  log_path,
+                    hidden_dim=128, 
+                    lr_optim=lr_optim, 
+                    lr_discr=lr_discr, 
+                    log_path =  log_path,
                     label_smoothing = label_smoothing,
                     label_smoothing_params = label_smoothing_params,
                     num_gen_iterations = num_gen_iterations,
@@ -50,7 +72,8 @@ def train(data_path,
                     entropy_weight=entropy_weight,
                     gen_clip_grad_value=gen_clip_grad_value,
                     add_validity=add_validity,
-                     device=device)
+                    model_path=model_path,
+                    device=device)
     loader = gan_mol.create_dataloader(data, batch_size=bs, shuffle=True, num_workers=1)
     gan_mol.train_n_steps(loader, max_epoch=epochs, evaluate_every=50)
     pi.dump(gan_mol, open(model_path, 'wb'))

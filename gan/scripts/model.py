@@ -10,6 +10,7 @@ from torch.nn.utils import clip_grad_value_
 from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 import os
+import pickle as pi
 
 from scripts.layers import Generator, RecurrentDiscriminator
 from scripts.tokenizer import Tokenizer
@@ -31,6 +32,7 @@ class MolGen(nn.Module):
                  entropy_weight = 0.01,
                  gen_clip_grad_value=0.1,
                  add_validity=False,
+                 model_path='/mnt/tank/scratch/aergardt/generative_models/gan/checkpoints/tmp.pkl',
                  device='cpu'
                  ):
         """[summary]
@@ -51,9 +53,9 @@ class MolGen(nn.Module):
 
         self.generator = Generator(
             latent_dim=hidden_dim,
-            vocab_size=self.tokenizer.vocab_size - 1,
-            start_token=self.tokenizer.start_token - 1,  # no need token
-            end_token=self.tokenizer.end_token - 1,
+            vocab_size=self.tokenizer.vocab_size,
+            start_token=self.tokenizer.start_token,  # no need token
+            end_token=self.tokenizer.end_token,
         ).to(device)
 
         self.discriminator = RecurrentDiscriminator(
@@ -72,7 +74,11 @@ class MolGen(nn.Module):
         self.b = 0.  # baseline reward
         self.log_path = log_path
         os.makedirs(self.log_path, exist_ok=True)
-        self.history = {'step': [], 'loss_disc': [], 'loss_gen': [], 'mean_reward': []}
+        self.history = {'step': [],
+                        'loss_disc': [], 
+                        'loss_gen': [], 
+                        'mean_reward': [],
+                        'mean_valid_100': []}
         self.global_step = 0
         self.num_gen_iterations =  num_gen_iterations
         self.label_smoothing = label_smoothing
@@ -85,7 +91,13 @@ class MolGen(nn.Module):
         self.entropy_weight = entropy_weight
         self.gen_clip_grad_value = gen_clip_grad_value
         self.add_validity=add_validity
-        
+        self.model_path = model_path
+
+        print("=== Generator Debug ===")
+        print("Generator vocab_size:", self.generator.vocab_size)
+        print("Tokenizer vocab_size:", self.tokenizer.vocab_size)
+        print("Start token (gen):", self.generator.start_token)
+        print("Start token (tok):", self.tokenizer.start_token)
 
 
     def sample_latent(self, batch_size):
@@ -122,6 +134,42 @@ class MolGen(nn.Module):
 
     def train_step(self, x):
         """One training step with built-in logging and plotting."""
+        # print("\n=== TRAIN STEP DEBUG ===")
+        # print("Real batch shape:", x.shape)
+        # print("Real SMILES example:", self.get_mapped(x[0].cpu().numpy()))
+        
+        # z = self.sample_latent(2)  # маленький батч
+        # gen_out = self.generator(z, max_len=20)  # короткие SMILES
+        # x_gen = gen_out['x']
+        
+        # # Декодируем ДО подачи в дискриминатор
+        # print("\nGenerated token tensors (raw):")
+        # print(x_gen[0])
+        
+        # # Заменяем padding (-1 → 0) для дискриминатора
+        # # x_gen_for_disc = torch.where(x_gen == -1, torch.zeros_like(x_gen), x_gen)
+        
+        # # Декодируем для человека
+        # lengths = (x_gen > 0).sum(1)
+        # smiles_list = []
+        # for i in range(x_gen.size(0)):
+        #     seq = x_gen[i].cpu().numpy()
+        #     seq = seq[:lengths[i]]  # обрезаем по padding
+        #     if len(seq) > 0 and seq[-1] == self.generator.end_token:
+        #         seq = seq[:-1]
+        #     try:
+        #         smi = self.get_mapped(seq.tolist())
+        #     except Exception as e:
+        #         smi = f"DECODE_ERROR: {e}"
+        #     smiles_list.append(smi)
+        
+        # print("\nGenerated SMILES:")
+        # for i, smi in enumerate(smiles_list):
+        #     print(f"{i+1}: {smi}")
+        
+        # # Проверка валидности
+        # valids = [Chem.MolFromSmiles(smi) is not None for smi in smiles_list]
+        # print("Validity:", valids)
 
         batch_size, len_real = x.size()
         x_real = x.to(self.device)
@@ -132,10 +180,11 @@ class MolGen(nn.Module):
 
 
         for i in range(self.num_gen_iterations):
+
+
             z = self.sample_latent(batch_size)
             generator_outputs = self.generator.forward(z, max_len=100)
             x_gen, log_probs, entropies = generator_outputs.values()
-
 
             # НОВАЯ СТРОЧКА  
             # x_gen_for_disc = torch.where(x_gen == -1, torch.zeros_like(x_gen), x_gen)
@@ -174,19 +223,21 @@ class MolGen(nn.Module):
                  R = (2 * y_pred - 1)
 
             if self.add_validity:
-                
                 validity_rewards = []
                 for smi in smiles_list:
                     try:
                         mol = Chem.MolFromSmiles(smi)
                         if mol is not None:
-                            validity_rewards.append(1.0)
+                            if ' ' not in smi:
+                                validity_rewards.append(1.0)
+                            else:
+                                validity_rewards.append(0.0)
                         else:
                             validity_rewards.append(0.0)
                     except:
                         validity_rewards.append(0.0)
                 validity_rewards = torch.tensor(validity_rewards, device=R.device).unsqueeze(1)
-                R = 0.5 * R + 0.5 * validity_rewards
+                R = (1 - self.add_validity) * R + self.add_validity * validity_rewards
 
             lengths = y_pred_mask.sum(1).long()
             list_rewards = [rw[:ln] for rw, ln in zip(R, lengths)]
@@ -242,7 +293,7 @@ class MolGen(nn.Module):
             num_workers=num_workers
         )
 
-    def train_n_steps(self, train_loader, max_epoch=10000, evaluate_every=50):
+    def train_n_steps(self, train_loader, max_epoch=10000, evaluate_every=50, save_every=100):
         for epoch in range(max_epoch):
             print('#' * 12, f'Epoch: {epoch}', '#' * 12, sep='\n')
             
@@ -258,7 +309,7 @@ class MolGen(nn.Module):
                 self.history['loss_disc'].append(metrics['loss_disc'])
                 self.history['loss_gen'].append(metrics['loss_gen'])
                 self.history['mean_reward'].append(metrics['mean_reward'])
-
+                current_valid = getattr(self, '_last_valid_score', float('nan'))
 
                 # Оценка каждые N батчей
                 if i % evaluate_every == 0:
@@ -266,6 +317,15 @@ class MolGen(nn.Module):
                     score = self.evaluate_n(100)
                     self.train()
                     print(f'Valid = {score:.2f}')
+                    current_valid = score
+                    self._last_valid_score = score
+                self.history['mean_valid_100'].append(current_valid)
+                
+                if self.global_step % save_every == 0:
+                    with open(self.model_path, 'wb') as f:
+                        pi.dump(self, f)
+                    print(f'Model is updated on {self.global_step} global step')
+
 
                 log_file = os.path.join(self.log_path, "training_log.csv")
                 pd.DataFrame(self.history).to_csv(log_file, index=False)
@@ -288,12 +348,7 @@ class MolGen(nn.Module):
                 plt.savefig(os.path.join(self.log_path, "losses.png"))
                 plt.close()
 
-                
-            
-
             # === Конец эпохи: сохранение и отрисовка ===
-
-
             
             print(f"Epoch {epoch} completed. Plot and log saved.")
     
@@ -347,7 +402,7 @@ class MolGen(nn.Module):
 
         print(pack[:2])
 
-        valid = np.array([Chem.MolFromSmiles(k) is not None for k in pack])
+        valid = np.array([Chem.MolFromSmiles(k) is not None and ' ' not in k for k in pack])
         if path is not None:
             pd.DataFrame(data={'0': pack, 'val_check': list(valid)}).to_csv(path)
         return valid.mean()

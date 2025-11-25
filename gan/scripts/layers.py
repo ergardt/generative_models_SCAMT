@@ -50,7 +50,7 @@ class Generator(nn.Module):
             nn.Linear(latent_dim, latent_dim * 2),
             nn.ReLU(),
             nn.Dropout(0.1),
-            nn.Linear(latent_dim * 2, vocab_size - 1)
+            nn.Linear(latent_dim * 2, vocab_size)
         )
 
     def forward(self, z, max_len=100):
@@ -98,8 +98,13 @@ class Generator(nn.Module):
             # h, c = self.rnn(emb, (h, c))
 
             # prediction
-            # logits = self.output_layer(h)
             logits = self.output_layer(output.squeeze(1))
+
+            # 🔥 ЗАПРЕТИТЬ НЕДОПУСТИМЫЕ ТОКЕНЫ 🔥
+            logits[:, 0] = -1e9  # <pad>
+            logits[:, self.start_token] = -1e9  # <sos>
+            if i < 3:
+                logits[:, self.end_token] = -1e9
 
             # create dist
             dist = Categorical(logits=logits)
@@ -144,9 +149,9 @@ class Generator(nn.Module):
             _entropies.append(ent[:length].mean())
 
         x = torch.nn.utils.rnn.pad_sequence(
-            _x, batch_first=True, padding_value=-1)
+            _x, batch_first=True, padding_value=0)
 
-        x = x + 1  # add padding token
+        # x = x + 1  # add padding token
 
         return {'x': x, 'log_probabilities': _log_probabilities, 'entropies': _entropies}
 
