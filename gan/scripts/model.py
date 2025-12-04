@@ -111,7 +111,7 @@ class MolGen(nn.Module):
         """
         return torch.randn(batch_size, self.hidden_dim).to(self.device)
 
-    def discriminator_loss(self, x, y):
+    def discriminator_loss(self, x, y, is_real):
         """Discriminator loss
 
         Args:
@@ -125,12 +125,23 @@ class MolGen(nn.Module):
 
         y_pred, mask = self.discriminator(x).values()
 
-        loss = F.binary_cross_entropy(
-            y_pred, y.float(), reduction='none') * mask
+        # loss = F.binary_cross_entropy(
+        #     y_pred, y.float(), reduction='none') * mask
+        # loss = loss.sum() / mask.sum()
 
-        loss = loss.sum() / mask.sum()
+        # y_pred_masked = y_pred * mask
+        # loss = (y_pred_masked * y.unsqueeze(-1)).sum() / mask.sum()
 
-        return loss
+        masked_output = y_pred * mask
+        mean_output = masked_output.sum() / mask.sum()
+
+        # return loss
+        if is_real:
+        # Хотим, чтобы D(real) был МАКСИМАЛЬНЫМ → лосс = -D(real)
+            return -mean_output
+        else:
+            # Хотим, чтобы D(fake) был МИНИМАЛЬНЫМ → лосс = +D(fake)
+            return mean_output
 
     def train_step(self, x):
         """One training step with built-in logging and plotting."""
@@ -183,27 +194,31 @@ class MolGen(nn.Module):
 
 
             z = self.sample_latent(batch_size)
-            generator_outputs = self.generator.forward(z, max_len=100)
+            generator_outputs = self.generator.forward(z, max_len=40)
             x_gen, log_probs, entropies = generator_outputs.values()
 
             # НОВАЯ СТРОЧКА  
             # x_gen_for_disc = torch.where(x_gen == -1, torch.zeros_like(x_gen), x_gen)
 
             _, len_gen = x_gen.size()
-            if self.label_smoothing:
-                y_gen = torch.full((batch_size, len_gen), self.label_smoothing_params[0], device=self.device)
-            else:
-                y_gen = torch.zeros(batch_size, len_gen).to(self.device)
+            # if self.label_smoothing:
+            #     y_gen = torch.full((batch_size, len_gen), self.label_smoothing_params[0], device=self.device)
+            # else:
+            #     y_gen = torch.zeros(batch_size, len_gen).to(self.device)
+
+            y_gen = -torch.ones(batch_size, len_gen, device=self.device)    # -1
 
             #####################
             # Train Discriminator
             #####################
             if i==0:
                 self.discriminator_optim.zero_grad()
-                fake_loss = self.discriminator_loss(x_gen, y_gen)
+                fake_loss = self.discriminator_loss(x_gen, y_gen, is_real=False)
                 # fake_loss = self.discriminator_loss(x_gen_for_disc, y_gen)
-                real_loss = self.discriminator_loss(x_real, y_real)
-                discr_loss = 0.5 * (real_loss + fake_loss)
+                real_loss = self.discriminator_loss(x_real, y_real, is_real=True)
+                # discr_loss = 0.5 * (real_loss + fake_loss)
+
+                discr_loss = fake_loss + real_loss
                 discr_loss.backward()
                 clip_grad_value_(self.discriminator.parameters(), 0.1)
                 self.discriminator_optim.step()
@@ -217,10 +232,17 @@ class MolGen(nn.Module):
             smiles_list = [self.get_mapped(x_i[:l-1].numpy()) for x_i, l in zip(x_gen.cpu(), lengths)]
             
             # y_pred, y_pred_mask = self.discriminator(x_gen_for_disc).values()
+            # r_value = 2 * y_pred - 1
+            unique_count = len(set(smiles_list))
+            uniqueness = unique_count / len(smiles_list)
+
+            r_value = 0.7 * y_pred + 0.3 * uniqueness
+
+
             if self.reward_clamp:
-                R = torch.clamp(2 * y_pred - 1, min=-0.9, max=0.9)
+                R = torch.clamp(r_value, min=-0.9, max=0.9)
             else:
-                 R = (2 * y_pred - 1)
+                 R = r_value
 
             if self.add_validity:
                 validity_rewards = []

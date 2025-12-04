@@ -1,0 +1,24 @@
+data_path: ./data/smiles_QED>0_85.csv
+model_path: /mnt/tank/scratch/aergardt/generative-models/gan/checkpoints/gan_mol_zinc_v25.pkl
+molecules_path: /mnt/tank/scratch/aergardt/generative-models/gan/result/generated_molecules_gan_zinc_v25.csv
+bs: 256
+lr_optim: 0.0001
+lr_discr: 0.0001
+epochs: 5
+num_molecules: 2000
+log_path: ./molgen_logs/zinc_v25
+label_smoothing: False
+label_smoothing_params: (0.1, 0.9)
+num_gen_iterations: 1
+reward_clamp: True
+update_baseline_weights: (0.99, 0.01)
+entropy_weight: 0.05 # раньше везде стоял 0.01
+gen_clip_grad_value: 0.1 # раньше везде стоял 0.1
+add_validity: 0.1
+
+# self.rnn = nn.LSTM(latent_dim, latent_dim, num_layers=2, batch_first=True)
+# после исправлений токенизации
+# добавила проверку на валидность строк (rdkit не смотрит на все что после пробела)
+# Wasserstein loss
+# добавили uniqueness в reward
+# max_len = 40
