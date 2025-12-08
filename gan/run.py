@@ -21,14 +21,14 @@ def train(data_path,
            lr_optim, 
            lr_discr, 
            log_path,
-           label_smoothing,
-           label_smoothing_params,
+        #    label_smoothing,
+        #    label_smoothing_params,
            num_gen_iterations,
-           reward_clamp,
-           update_baseline_weights,
-           entropy_weight,
+        #    reward_clamp,
+        #    update_baseline_weights,
+        #    entropy_weight,
            gen_clip_grad_value,
-           add_validity,
+        #    add_validity,
            epochs, 
            device):
     # with open(data_path) as f:
@@ -56,6 +56,8 @@ def train(data_path,
     with open(data_path, "r") as f:
         for line in f.readlines()[1:]:
             data.append(line.split("\n")[0])
+    # data = data[:100000]/
+    print(len(data))
     print(f"Первые 3 SMILES: {data[:3]}")
 
     print('training model...')
@@ -64,14 +66,14 @@ def train(data_path,
                     lr_optim=lr_optim, 
                     lr_discr=lr_discr, 
                     log_path =  log_path,
-                    label_smoothing = label_smoothing,
-                    label_smoothing_params = label_smoothing_params,
+                    # label_smoothing = label_smoothing,
+                    # label_smoothing_params = label_smoothing_params,
                     num_gen_iterations = num_gen_iterations,
-                    reward_clamp = reward_clamp,
-                    update_baseline_weights = update_baseline_weights,
-                    entropy_weight=entropy_weight,
+                    # reward_clamp = reward_clamp,
+                    # update_baseline_weights = update_baseline_weights,
+                    # entropy_weight=entropy_weight,
                     gen_clip_grad_value=gen_clip_grad_value,
-                    add_validity=add_validity,
+                    # add_validity=add_validity,
                     model_path=model_path,
                     device=device)
     loader = gan_mol.create_dataloader(data, batch_size=bs, shuffle=True, num_workers=1)
@@ -144,14 +146,14 @@ def main():
     epochs = args['epochs']
     num_molecules = args['num_molecules']
     log_path = args['log_path']
-    label_smoothing = args['label_smoothing']
-    label_smoothing_params = args['label_smoothing_params']
+    # label_smoothing = args['label_smoothing']
+    # label_smoothing_params = args['label_smoothing_params']
     num_gen_iterations = args['num_gen_iterations']
-    reward_clamp = args['reward_clamp']
-    update_baseline_weights = args['update_baseline_weights']
-    entropy_weight = args['entropy_weight']
+    # reward_clamp = args['reward_clamp']
+    # update_baseline_weights = args['update_baseline_weights']
+    # entropy_weight = args['entropy_weight']
     gen_clip_grad_value = args['gen_clip_grad_value']
-    add_validity=args['add_validity']
+    # add_validity=args['add_validity']
 
     if mode == 'training':
         print(f"Запуск обучения на устройстве: {device}")
@@ -162,14 +164,14 @@ def main():
             lr_optim,
             lr_discr, 
             log_path = log_path,
-            label_smoothing = label_smoothing,
-            label_smoothing_params = label_smoothing_params,
+            # label_smoothing = label_smoothing,
+            # label_smoothing_params = label_smoothing_params,
             num_gen_iterations = num_gen_iterations,
-            reward_clamp = reward_clamp,
-            update_baseline_weights=  update_baseline_weights,
-            entropy_weight=entropy_weight,
+            # reward_clamp = reward_clamp,
+            # update_baseline_weights=  update_baseline_weights,
+            # entropy_weight=entropy_weight,
             gen_clip_grad_value=gen_clip_grad_value,
-            add_validity=add_validity,
+            # add_validity=add_validity,
             epochs=epochs, 
             device=device)
     

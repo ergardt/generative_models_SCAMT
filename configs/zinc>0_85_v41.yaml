@@ -1,0 +1,26 @@
+data_path: ./data/smiles_QED>0_85.csv
+model_path: /mnt/tank/scratch/aergardt/generative-models/gan/checkpoints/gan_mol_zinc_v41.pkl
+molecules_path: /mnt/tank/scratch/aergardt/generative-models/gan/result/generated_molecules_gan_zinc_v41.csv
+log_path: ./molgen_logs/zinc_v41
+bs: 256
+lr_optim: 0.001
+lr_discr: 0.00005
+epochs: 5
+num_molecules: 2000
+num_gen_iterations: 1 # теперь чаще обновляется дискриминатор
+entropy_weight: 0.1 # раньше везде стоял 0.01
+gen_clip_grad_value: 0.1 # раньше везде стоял 0.1
+
+# self.rnn = nn.LSTM(latent_dim, latent_dim, num_layers=2, batch_first=True)
+# после исправлений токенизации
+# добавила проверку на валидность строк (rdkit не смотрит на все что после пробела)
+# Wasserstein loss
+# добавили uniqueness в reward
+# max_len = 40
+# переписана логика дискриминатора на WGAN
+# в дискриминаторе трансформер, GP
+
+# нормировка дискр
+# нормировка в critical head в дискриминатор
+# лямбда gp  200
+

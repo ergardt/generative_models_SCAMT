@@ -3,6 +3,7 @@ from scripts.utils import LstmSeq2SeqEncoder, TransformerModel
 from torch import nn
 from torch.distributions import Categorical
 from torch.nn.modules.activation import Sigmoid
+from torch.nn import TransformerEncoder, TransformerEncoderLayer
 
 
 class Generator(nn.Module):
@@ -158,66 +159,138 @@ class Generator(nn.Module):
 
 
 
+# В scripts.layers — замените RecurrentDiscriminator на:
+
 class RecurrentDiscriminator(nn.Module):
-
     def __init__(self, hidden_size, vocab_size, start_token, bidirectional=True):
-        """Reccurent discriminator
-
-        Args:
-            hidden_size (int): model hidden size
-            vocab_size (int): vocabulary size
-            bidirectional (bool, optional): [description]. Defaults to True.
-        """
-
         super().__init__()
-
         self.start_token = start_token
-
         self.embedding = nn.Embedding(vocab_size, hidden_size, padding_idx=0)
 
         self.rnn = LstmSeq2SeqEncoder(
-            hidden_size, hidden_size, num_layers=1, bidirectional=bidirectional)
-
-        if bidirectional:
-            hidden_size = hidden_size * 2
-
-        self.fc = nn.Sequential(
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_size, hidden_size * 2),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_size * 2, 1),
-            nn.Sigmoid()
+            input_size=hidden_size,
+            hidden_size=hidden_size,
+            num_layers=2,
+            bidirectional=bidirectional,
+            dropout=0.1
         )
 
-    def forward(self, x):
-        """[summary]
+        rnn_output_size = hidden_size * (2 if bidirectional else 1)
 
-        Args:
-            x ([type]): [description]
+        self.critic_head = nn.Sequential(
+            nn.Linear(rnn_output_size, rnn_output_size),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(rnn_output_size, 1)  # ← нет Sigmoid!
+        )
 
-        Returns:
-            [type]: [description]
-        """
+# В RecurrentDiscriminator (layers.py)
+    def forward(self, x, from_embeddings=False):
+        if from_embeddings:
+            # x — это уже эмбеддинги: [B, L, H]
+            emb = x
+            batch_size, seq_len, _ = emb.shape
+            
+            # Маска: предполагаем, что padding — нулевые эмбеддинги
+            # Но лучше передавать маску отдельно! Пока сделаем приближение:
+            mask = (emb.abs().sum(dim=-1) != 0)  # [B, L]
+            
+            # Добавляем <sos> эмбеддинг в начало
+            sos_emb = self.embedding(torch.tensor(self.start_token, device=emb.device)).unsqueeze(0).unsqueeze(0)  # [1,1,H]
+            sos_emb = sos_emb.expand(batch_size, 1, -1)
+            emb = torch.cat([sos_emb, emb], dim=1)  # [B, L+1, H]
+            mask = torch.cat([torch.ones(batch_size, 1, dtype=torch.bool, device=emb.device), mask], dim=1)
+        else:
+            # Обычный режим: x — токены (LongTensor)
+            batch_size, seq_len = x.shape
+            starts = torch.full((batch_size, 1), self.start_token, device=x.device, dtype=torch.long)
+            x = torch.cat([starts, x], dim=1)  # [B, L+1]
+            mask = (x != 0)
+            emb = self.embedding(x)  # [B, L+1, H]
+        
+        rnn_out = self.rnn(emb, mask)
+        masked_out = rnn_out * mask.unsqueeze(-1)
+        lengths = mask.sum(dim=1, keepdim=True).clamp(min=1)
+        seq_repr = masked_out.sum(dim=1) / lengths
+        return self.critic_head(seq_repr)
+    
 
-        batch_size, _ = x.size()
 
-        # append start token to the input
-        starts = torch.full(
-            size=(batch_size, 1), fill_value=self.start_token, device=x.device).long()
+import torch
+import torch.nn as nn
+from scripts.utils import TransformerModel  # убедитесь, что он возвращает [B, L, H]
 
-        x = torch.cat([starts, x], dim=1)
 
-        mask = x > 0
+from torch.nn import TransformerEncoder, TransformerEncoderLayer, LayerNorm
 
-        # embed input [batch_size, max_len, hidden_size]
-        emb = self.embedding(x)
+class TransformerDiscriminator(nn.Module):
+    def __init__(self, hidden_size, vocab_size, max_len, start_token, num_layers=4, nhead=8, dropout=0.1):
+        super().__init__()
+        self.start_token = start_token
+        self.max_len = max_len
+        
+        self.embedding = nn.Embedding(vocab_size, hidden_size, padding_idx=0)
+        self.embed_layer_norm = LayerNorm(hidden_size)  # ← ДОБАВЛЕНО
+        
+        self.pos_encoding = nn.Parameter(torch.randn(1, max_len + 1, hidden_size))  # +1 для <sos>
 
-        # contextualize representation
-        x = self.rnn(emb, mask)
 
-        # prediction for each sequence
-        out = self.fc(x).squeeze(-1)  # [B, max_len]
+        
+        encoder_layer = TransformerEncoderLayer(
+            d_model=hidden_size,
+            nhead=nhead,
+            dim_feedforward=hidden_size * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True
+        )
+        self.transformer = TransformerEncoder(encoder_layer, num_layers=num_layers)
+        
+        self.critic_head = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            LayerNorm(hidden_size),
+            nn.Linear(hidden_size, 1),
+        )
+        nn.init.normal_(self.critic_head[-1].weight, mean=0.0, std=0.01)
+        nn.init.constant_(self.critic_head[-1].bias, 0.0)
 
-        return {'out': out[:, 1:], 'mask': mask.float()[:, 1:]}
+    def forward(self, x, from_embeddings=False):
+        if from_embeddings:
+            emb = x
+            batch_size, seq_len, _ = emb.shape
+            mask = (emb.abs().sum(dim=-1) != 0)
+
+            # Добавляем <sos> эмбеддинг
+            sos_emb = self.embedding(torch.tensor(self.start_token, device=emb.device)).unsqueeze(0).unsqueeze(0)
+            sos_emb = sos_emb.expand(batch_size, 1, -1)
+            emb = torch.cat([sos_emb, emb], dim=1)
+            mask = torch.cat([torch.ones(batch_size, 1, dtype=torch.bool, device=emb.device), mask], dim=1)
+            
+            # Применяем LayerNorm после конкатенации (включая <sos>)
+            emb = self.embed_layer_norm(emb)
+            
+        else:
+            batch_size, seq_len = x.shape
+            starts = torch.full((batch_size, 1), self.start_token, device=x.device, dtype=torch.long)
+            x = torch.cat([starts, x], dim=1)
+            x = x[:, :self.max_len + 1]
+            mask = (x != 0)
+            emb = self.embedding(x)
+            
+            # Применяем LayerNorm ко всей последовательности (включая <sos>)
+            emb = self.embed_layer_norm(emb)
+        
+        # Позиционное кодирование
+        emb = emb + self.pos_encoding[:, :emb.size(1), :]
+        
+        # Transformer
+        transformer_out = self.transformer(emb, src_key_padding_mask=~mask)
+        
+        # Глобальный пуллинг
+        masked_out = transformer_out * mask.unsqueeze(-1)
+        lengths = mask.sum(dim=1, keepdim=True).clamp(min=1)
+        seq_repr = masked_out.sum(dim=1) / lengths
+        
+        return self.critic_head(seq_repr)

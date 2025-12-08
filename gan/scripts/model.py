@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 import os
 import pickle as pi
 
-from scripts.layers import Generator, RecurrentDiscriminator
+from scripts.layers import Generator, RecurrentDiscriminator, TransformerDiscriminator
 from scripts.tokenizer import Tokenizer
 
 
@@ -24,14 +24,14 @@ class MolGen(nn.Module):
                  lr_optim=1e-3, 
                  lr_discr=1e-3, 
                  log_path =  './molgen_logs/tmp',
-                 label_smoothing = False,
-                 label_smoothing_params = [0, 1],
+                #  label_smoothing = False,
+                #  label_smoothing_params = [0, 1],
                  num_gen_iterations = 1,
-                 reward_clamp = False,
-                 update_baseline_weights = [0.9, 0.1],
-                 entropy_weight = 0.01,
+                #  reward_clamp = False,
+                #  update_baseline_weights = [0.9, 0.1],
+                #  entropy_weight = 0.01,
                  gen_clip_grad_value=0.1,
-                 add_validity=False,
+                #  add_validity=False,
                  model_path='/mnt/tank/scratch/aergardt/generative_models/gan/checkpoints/tmp.pkl',
                  device='cpu'
                  ):
@@ -48,9 +48,9 @@ class MolGen(nn.Module):
         self.device = device
 
         self.hidden_dim = hidden_dim
+        self.max_seq_len = 100
 
-        self.tokenizer = Tokenizer(data)
-
+        self.tokenizer = Tokenizer(data, max_len=self.max_seq_len)
         self.generator = Generator(
             latent_dim=hidden_dim,
             vocab_size=self.tokenizer.vocab_size,
@@ -58,11 +58,21 @@ class MolGen(nn.Module):
             end_token=self.tokenizer.end_token,
         ).to(device)
 
-        self.discriminator = RecurrentDiscriminator(
+        # self.discriminator = RecurrentDiscriminator(
+        #     hidden_size=hidden_dim,
+        #     vocab_size=self.tokenizer.vocab_size,
+        #     start_token=self.tokenizer.start_token,
+        #     bidirectional=True
+        # ).to(device)
+
+        self.discriminator = TransformerDiscriminator(
             hidden_size=hidden_dim,
             vocab_size=self.tokenizer.vocab_size,
+            max_len=self.max_seq_len,
             start_token=self.tokenizer.start_token,
-            bidirectional=True
+            num_layers=4,
+            nhead=8,
+            dropout=0.1
         ).to(device)
 
         self.generator_optim = torch.optim.Adam(
@@ -81,23 +91,18 @@ class MolGen(nn.Module):
                         'mean_valid_100': []}
         self.global_step = 0
         self.num_gen_iterations =  num_gen_iterations
-        self.label_smoothing = label_smoothing
-        self.label_smoothing_params = label_smoothing_params
-        print("DEBUG: label_smoothing_params =", self.label_smoothing_params)
-        print("DEBUG: type =", type(self.label_smoothing_params))
-        print("DEBUG: len =", len(self.label_smoothing_params) if hasattr(self.label_smoothing_params, '__len__') else 'N/A')
-        self.reward_clamp = reward_clamp
-        self.update_baseline_weights = update_baseline_weights
-        self.entropy_weight = entropy_weight
+        # self.label_smoothing = label_smoothing
+        # self.label_smoothing_params = label_smoothing_params
+       
+        # self.reward_clamp = reward_clamp
+        # self.update_baseline_weights = update_baseline_weights
+        # self.entropy_weight = entropy_weight
         self.gen_clip_grad_value = gen_clip_grad_value
-        self.add_validity=add_validity
+        # self.add_validity=add_validity
         self.model_path = model_path
 
-        print("=== Generator Debug ===")
-        print("Generator vocab_size:", self.generator.vocab_size)
-        print("Tokenizer vocab_size:", self.tokenizer.vocab_size)
-        print("Start token (gen):", self.generator.start_token)
-        print("Start token (tok):", self.tokenizer.start_token)
+        print(f"Max sequence length in data: {self.max_seq_len}")
+
 
 
     def sample_latent(self, batch_size):
@@ -111,188 +116,82 @@ class MolGen(nn.Module):
         """
         return torch.randn(batch_size, self.hidden_dim).to(self.device)
 
-    def discriminator_loss(self, x, y, is_real):
-        """Discriminator loss
 
-        Args:
-            x (torch.LongTensor): input sequence [batch_size, max_len]
-            y (torch.LongTensor): sequence label (zeros from generatoe, ones from real data)
-                                  [batch_size, max_len]
-
-        Returns:
-            loss value
-        """
-
-        y_pred, mask = self.discriminator(x).values()
-
-        # loss = F.binary_cross_entropy(
-        #     y_pred, y.float(), reduction='none') * mask
-        # loss = loss.sum() / mask.sum()
-
-        # y_pred_masked = y_pred * mask
-        # loss = (y_pred_masked * y.unsqueeze(-1)).sum() / mask.sum()
-
-        masked_output = y_pred * mask
-        mean_output = masked_output.sum() / mask.sum()
-
-        # return loss
-        if is_real:
-        # Хотим, чтобы D(real) был МАКСИМАЛЬНЫМ → лосс = -D(real)
-            return -mean_output
-        else:
-            # Хотим, чтобы D(fake) был МИНИМАЛЬНЫМ → лосс = +D(fake)
-            return mean_output
+    def gradient_penalty(self, real_tokens, fake_tokens):
+        real_emb = self.discriminator.embedding(real_tokens)
+        fake_emb = self.discriminator.embedding(fake_tokens)
+        
+        batch_size, seq_len, emb_dim = real_emb.shape
+        alpha = torch.rand(batch_size, 1, 1, device=self.device)
+        interpolates = alpha * real_emb + (1 - alpha) * fake_emb
+        interpolates = interpolates.requires_grad_(True)
+        
+        # Теперь можно вызывать напрямую — без CuDNN проблем!
+        disc_interpolates = self.discriminator(interpolates, from_embeddings=True)
+        
+        gradients = torch.autograd.grad(
+            outputs=disc_interpolates,
+            inputs=interpolates,
+            grad_outputs=torch.ones_like(disc_interpolates),
+            create_graph=True,
+            retain_graph=True,
+            only_inputs=True
+        )[0]
+        
+        gradients = gradients.view(batch_size, -1)
+        gp = ((gradients.norm(2, dim=1) - 1) ** 2).mean()
+        return gp
 
     def train_step(self, x):
-        """One training step with built-in logging and plotting."""
-        # print("\n=== TRAIN STEP DEBUG ===")
-        # print("Real batch shape:", x.shape)
-        # print("Real SMILES example:", self.get_mapped(x[0].cpu().numpy()))
-        
-        # z = self.sample_latent(2)  # маленький батч
-        # gen_out = self.generator(z, max_len=20)  # короткие SMILES
-        # x_gen = gen_out['x']
-        
-        # # Декодируем ДО подачи в дискриминатор
-        # print("\nGenerated token tensors (raw):")
-        # print(x_gen[0])
-        
-        # # Заменяем padding (-1 → 0) для дискриминатора
-        # # x_gen_for_disc = torch.where(x_gen == -1, torch.zeros_like(x_gen), x_gen)
-        
-        # # Декодируем для человека
-        # lengths = (x_gen > 0).sum(1)
-        # smiles_list = []
-        # for i in range(x_gen.size(0)):
-        #     seq = x_gen[i].cpu().numpy()
-        #     seq = seq[:lengths[i]]  # обрезаем по padding
-        #     if len(seq) > 0 and seq[-1] == self.generator.end_token:
-        #         seq = seq[:-1]
-        #     try:
-        #         smi = self.get_mapped(seq.tolist())
-        #     except Exception as e:
-        #         smi = f"DECODE_ERROR: {e}"
-        #     smiles_list.append(smi)
-        
-        # print("\nGenerated SMILES:")
-        # for i, smi in enumerate(smiles_list):
-        #     print(f"{i+1}: {smi}")
-        
-        # # Проверка валидности
-        # valids = [Chem.MolFromSmiles(smi) is not None for smi in smiles_list]
-        # print("Validity:", valids)
-
-        batch_size, len_real = x.size()
+        batch_size = x.size(0)
         x_real = x.to(self.device)
-        if self.label_smoothing:
-            y_real = torch.full((batch_size, len_real), self.label_smoothing_params[1], device=self.device)
-        else:
-            y_real = torch.ones(batch_size, len_real).to(self.device)
 
+        # Генерация
+        z = self.sample_latent(batch_size)
+        gen_out = self.generator(z, max_len=x_real.size(1))
+        x_gen = gen_out['x']
 
-        for i in range(self.num_gen_iterations):
+        # Выравнивание длины
+        if x_gen.size(1) < x_real.size(1):
+            pad = torch.zeros(x_gen.size(0), x_real.size(1) - x_gen.size(1), dtype=x_gen.dtype, device=x_gen.device)
+            x_gen = torch.cat([x_gen, pad], dim=1)
+        elif x_gen.size(1) > x_real.size(1):
+            x_gen = x_gen[:, :x_real.size(1)]
 
+        # Обучение дискриминатора
+        self.discriminator_optim.zero_grad()
+        real_score = self.discriminator(x_real).mean()
+        fake_score = self.discriminator(x_gen).mean()
+        gp = self.gradient_penalty(x_real, x_gen)  # ← добавьте это
+        print(f"[Step {self.global_step}] GP: {gp.item():.6f}")
+        disc_loss = -real_score + fake_score + 200.0 * gp  # ← + GP
+        disc_loss.backward()
+        clip_grad_value_(self.discriminator.parameters(), 0.1)
+        self.discriminator_optim.step()
 
-            z = self.sample_latent(batch_size)
-            generator_outputs = self.generator.forward(z, max_len=40)
-            x_gen, log_probs, entropies = generator_outputs.values()
+        # Weight clipping
+        # for p in self.discriminator.parameters():
+        #     p.data.clamp_(-0.01, 0.01)
 
-            # НОВАЯ СТРОЧКА  
-            # x_gen_for_disc = torch.where(x_gen == -1, torch.zeros_like(x_gen), x_gen)
-
-            _, len_gen = x_gen.size()
-            # if self.label_smoothing:
-            #     y_gen = torch.full((batch_size, len_gen), self.label_smoothing_params[0], device=self.device)
-            # else:
-            #     y_gen = torch.zeros(batch_size, len_gen).to(self.device)
-
-            y_gen = -torch.ones(batch_size, len_gen, device=self.device)    # -1
-
-            #####################
-            # Train Discriminator
-            #####################
-            if i==0:
-                self.discriminator_optim.zero_grad()
-                fake_loss = self.discriminator_loss(x_gen, y_gen, is_real=False)
-                # fake_loss = self.discriminator_loss(x_gen_for_disc, y_gen)
-                real_loss = self.discriminator_loss(x_real, y_real, is_real=True)
-                # discr_loss = 0.5 * (real_loss + fake_loss)
-
-                discr_loss = fake_loss + real_loss
-                discr_loss.backward()
-                clip_grad_value_(self.discriminator.parameters(), 0.1)
-                self.discriminator_optim.step()
-
-            #################
-            # Train Generator
-            #################
+        # Обучение генератора
+        gen_loss = 0.0
+        if self.global_step % self.num_gen_iterations == 0:
             self.generator_optim.zero_grad()
-            y_pred, y_pred_mask = self.discriminator(x_gen).values()
-            lengths = y_pred_mask.sum(1).long()
-            smiles_list = [self.get_mapped(x_i[:l-1].numpy()) for x_i, l in zip(x_gen.cpu(), lengths)]
-            
-            # y_pred, y_pred_mask = self.discriminator(x_gen_for_disc).values()
-            # r_value = 2 * y_pred - 1
-            unique_count = len(set(smiles_list))
-            uniqueness = unique_count / len(smiles_list)
-
-            r_value = 0.7 * y_pred + 0.3 * uniqueness
-
-
-            if self.reward_clamp:
-                R = torch.clamp(r_value, min=-0.9, max=0.9)
-            else:
-                 R = r_value
-
-            if self.add_validity:
-                validity_rewards = []
-                for smi in smiles_list:
-                    try:
-                        mol = Chem.MolFromSmiles(smi)
-                        if mol is not None:
-                            if ' ' not in smi:
-                                validity_rewards.append(1.0)
-                            else:
-                                validity_rewards.append(0.0)
-                        else:
-                            validity_rewards.append(0.0)
-                    except:
-                        validity_rewards.append(0.0)
-                validity_rewards = torch.tensor(validity_rewards, device=R.device).unsqueeze(1)
-                R = (1 - self.add_validity) * R + self.add_validity * validity_rewards
-
-            lengths = y_pred_mask.sum(1).long()
-            list_rewards = [rw[:ln] for rw, ln in zip(R, lengths)]
-
-            generator_loss = []
-            for reward, log_p in zip(list_rewards, log_probs):
-                reward_baseline = reward - self.b
-                generator_loss.append((- reward_baseline * log_p).sum())
-
-            generator_loss = torch.stack(generator_loss).mean() - sum(entropies) * self.entropy_weight / batch_size
-            generator_loss.backward()
+            gen_loss = -self.discriminator(x_gen).mean()
+            gen_loss.backward()
             clip_grad_value_(self.generator.parameters(), self.gen_clip_grad_value)
             self.generator_optim.step()
+        else:
+            gen_loss = torch.tensor(0.0, device=self.device)
 
-            # Update baseline
-            with torch.no_grad():
-                mean_reward = (R * y_pred_mask).sum() / y_pred_mask.sum()
-                self.b = self.update_baseline_weights[0] * self.b + self.update_baseline_weights[1] * mean_reward  # <<< медленнее!
-
-            # Save metrics
-            loss_disc_val = discr_loss.item()
-            loss_gen_val = generator_loss.item()
-            mean_reward_val = mean_reward.item()
-
-        print("Generated SMILES:")
-        for i in range(min(5, len(smiles_list))):
-            print(f"{i+1}: {smiles_list[i]}")
+        print(f"[Step {self.global_step}] D(real): {real_score.item():.4f}, D(fake): {fake_score.item():.4f}")
 
         return {
-            'loss_disc': loss_disc_val,
-            'loss_gen': loss_gen_val, 
-            'mean_reward': mean_reward_val
+            'loss_disc': disc_loss.item(),
+            'loss_gen': gen_loss.item(),
+            'mean_reward': fake_score.item(),
         }
+    
 
     def create_dataloader(self, data, batch_size=128, shuffle=True, num_workers=5):
         """create a dataloader
@@ -354,7 +253,7 @@ class MolGen(nn.Module):
                 # Отрисовка графиков
                 plt.figure(figsize=(12, 4))
                 for idx, (key, title, scale) in enumerate([
-                    ('loss_disc', 'Discriminator Loss (scaled)', True),
+                    ('loss_disc', 'Discriminator Loss', False),
                     ('loss_gen', 'Generator Loss (scaled)', True),
                     ('loss_gen', 'Generator Loss', False),
                     ('mean_reward', 'Mean Reward', False)
@@ -388,27 +287,21 @@ class MolGen(nn.Module):
 
     @torch.no_grad()
     def generate_n(self, n):
-        """Generate n molecules
-
-        Args:
-            n (int)
-
-        Returns:
-            list[str]: generated molecules
-        """
-
         z = torch.randn((n, self.hidden_dim)).to(self.device)
+        x = self.generator(z, max_len=self.max_seq_len)['x'].cpu()
+        lengths = (x > 0).sum(1)
 
-        x = self.generator(z)['x'].cpu()
-
-        # НОВАЯ СТРОЧКА
-        # x = torch.where(x == -1, torch.zeros_like(x), x) 
-
-        #pd.DataFrame
-        lenghts = (x > 0).sum(1)
-
-        # l - 1 because we exclude end tokens
-        return [self.get_mapped(x[:l-1].numpy()) for x, l in zip(x, lenghts)]
+        smiles_list = []
+        for seq, l in zip(x, lengths):
+            seq = seq[:l].numpy()
+            if len(seq) > 0 and seq[-1] == self.generator.end_token:
+                seq = seq[:-1]
+            try:
+                smi = self.get_mapped(seq.tolist())
+            except:
+                smi = ""
+            smiles_list.append(smi)
+        return smiles_list
 
     def evaluate_n(self, n, path = None):
         """Evaluation: frequence of valid molecules using rdkit
