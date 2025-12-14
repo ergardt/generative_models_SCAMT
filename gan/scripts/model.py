@@ -6,13 +6,13 @@ from rdkit import Chem, RDLogger
 from torch import nn
 import torch.utils.data as torch_data
 from torch.distributions import Categorical
-from torch.nn.utils import clip_grad_value_
+from torch.nn.utils import clip_grad_value_, clip_grad_norm_
 from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 import os
 import pickle as pi
 
-from scripts.layers import Generator, RecurrentDiscriminator, TransformerDiscriminator
+from scripts.layers import Generator, RecurrentDiscriminator, TransformerDiscriminator, TransformerGenerator
 from scripts.tokenizer import Tokenizer
 
 
@@ -20,7 +20,7 @@ class MolGen(nn.Module):
 
     def __init__(self, 
                  data, 
-                 hidden_dim=128, 
+                 hidden_dim=64, 
                  lr_optim=1e-3, 
                  lr_discr=1e-3, 
                  log_path =  './molgen_logs/tmp',
@@ -51,11 +51,21 @@ class MolGen(nn.Module):
         self.max_seq_len = 100
 
         self.tokenizer = Tokenizer(data, max_len=self.max_seq_len)
-        self.generator = Generator(
+        # self.generator = Generator(
+        #     latent_dim=hidden_dim,
+        #     vocab_size=self.tokenizer.vocab_size,
+        #     start_token=self.tokenizer.start_token,  # no need token
+        #     end_token=self.tokenizer.end_token,
+        # ).to(device)
+        self.generator = TransformerGenerator(
             latent_dim=hidden_dim,
             vocab_size=self.tokenizer.vocab_size,
-            start_token=self.tokenizer.start_token,  # no need token
+            max_len=self.max_seq_len,
+            start_token=self.tokenizer.start_token,
             end_token=self.tokenizer.end_token,
+            num_layers=2,
+            nhead=8,
+            dropout=0.1
         ).to(device)
 
         # self.discriminator = RecurrentDiscriminator(
@@ -70,7 +80,7 @@ class MolGen(nn.Module):
             vocab_size=self.tokenizer.vocab_size,
             max_len=self.max_seq_len,
             start_token=self.tokenizer.start_token,
-            num_layers=4,
+            num_layers=2,
             nhead=8,
             dropout=0.1
         ).to(device)
@@ -88,7 +98,11 @@ class MolGen(nn.Module):
                         'loss_disc': [], 
                         'loss_gen': [], 
                         'mean_reward': [],
-                        'mean_valid_100': []}
+                        'mean_valid_100': [],
+                        'd_real': [],               # ← НОВОЕ
+                        'd_fake': [],               # ← НОВОЕ
+                        'gp': []                    # ← НОВОЕ
+                        }
         self.global_step = 0
         self.num_gen_iterations =  num_gen_iterations
         # self.label_smoothing = label_smoothing
@@ -164,9 +178,11 @@ class MolGen(nn.Module):
         fake_score = self.discriminator(x_gen).mean()
         gp = self.gradient_penalty(x_real, x_gen)  # ← добавьте это
         print(f"[Step {self.global_step}] GP: {gp.item():.6f}")
-        disc_loss = -real_score + fake_score + 200.0 * gp  # ← + GP
+        disc_loss = -real_score + fake_score + 10.0 * gp  # ← + GP
         disc_loss.backward()
-        clip_grad_value_(self.discriminator.parameters(), 0.1)
+        # clip_grad_value_(self.discriminator.parameters(), 0.1)
+        clip_grad_norm_(self.discriminator.parameters(), 1)
+
         self.discriminator_optim.step()
 
         # Weight clipping
@@ -190,6 +206,9 @@ class MolGen(nn.Module):
             'loss_disc': disc_loss.item(),
             'loss_gen': gen_loss.item(),
             'mean_reward': fake_score.item(),
+            'd_real': real_score.item(),      # ← ДОБАВЛЕНО
+            'd_fake': fake_score.item(),      # ← ДОБАВЛЕНО
+            'gp': gp.item() 
         }
     
 
@@ -230,12 +249,15 @@ class MolGen(nn.Module):
                 self.history['loss_disc'].append(metrics['loss_disc'])
                 self.history['loss_gen'].append(metrics['loss_gen'])
                 self.history['mean_reward'].append(metrics['mean_reward'])
+                self.history['d_real'].append(metrics['d_real'])      # ← НОВОЕ
+                self.history['d_fake'].append(metrics['d_fake'])      # ← НОВОЕ
+                self.history['gp'].append(metrics['gp'])      
                 current_valid = getattr(self, '_last_valid_score', float('nan'))
 
                 # Оценка каждые N батчей
                 if i % evaluate_every == 0:
                     self.eval()
-                    score = self.evaluate_n(100)
+                    score = self.evaluate_n(1000)
                     self.train()
                     print(f'Valid = {score:.2f}')
                     current_valid = score
@@ -251,20 +273,67 @@ class MolGen(nn.Module):
                 log_file = os.path.join(self.log_path, "training_log.csv")
                 pd.DataFrame(self.history).to_csv(log_file, index=False)
                 # Отрисовка графиков
-                plt.figure(figsize=(12, 4))
-                for idx, (key, title, scale) in enumerate([
-                    ('loss_disc', 'Discriminator Loss', False),
-                    ('loss_gen', 'Generator Loss (scaled)', True),
-                    ('loss_gen', 'Generator Loss', False),
-                    ('mean_reward', 'Mean Reward', False)
-                ], 1):
-                    plt.subplot(1, 4, idx)
-                    plt.plot(self.history['step'], self.history[key])
-                    plt.title(title)
-                    plt.xlabel('Step')
-                    if scale:
-                        plt.ylim(-1, 1)
-                    plt.grid(True)
+                # plt.figure(figsize=(12, 4))
+                # for idx, (key, title, scale) in enumerate([
+                #     ('loss_disc', 'Discriminator Loss', False),
+                #     ('loss_gen', 'Generator Loss (scaled)', True),
+                #     ('loss_gen', 'Generator Loss', False),
+                #     ('mean_reward', 'Mean Reward', False)
+                # ], 1):
+                #     plt.subplot(1, 4, idx)
+                #     plt.plot(self.history['step'], self.history[key])
+                #     plt.title(title)
+                #     plt.xlabel('Step')
+                #     if scale:
+                #         plt.ylim(-1, 1)
+                #     plt.grid(True)
+                # plt.tight_layout()
+                # plt.savefig(os.path.join(self.log_path, "losses.png"))
+                # plt.close()
+                plt.figure(figsize=(15, 10))
+
+                # 1. Лоссы
+                plt.subplot(2, 3, 1)
+                plt.plot(self.history['step'], self.history['loss_disc'])
+                plt.title('Discriminator Loss')
+                plt.xlabel('Step')
+                plt.grid(True)
+
+                plt.subplot(2, 3, 2)
+                plt.plot(self.history['step'], self.history['loss_gen'])
+                plt.title('Generator Loss')
+                plt.xlabel('Step')
+                plt.grid(True)
+
+                # 2. D(real) и D(fake)
+                plt.subplot(2, 3, 3)
+                plt.plot(self.history['step'], self.history['d_real'], label='D(real)')
+                plt.plot(self.history['step'], self.history['d_fake'], label='D(fake)')
+                plt.title('Critic Scores')
+                plt.xlabel('Step')
+                plt.legend()
+                plt.grid(True)
+
+                # 3. Mean Reward и GP
+                plt.subplot(2, 3, 4)
+                plt.plot(self.history['step'], self.history['mean_reward'])
+                plt.title('Mean Reward (D(fake))')
+                plt.xlabel('Step')
+                plt.grid(True)
+
+                plt.subplot(2, 3, 5)
+                plt.plot(self.history['step'], self.history['gp'])
+                plt.title('Gradient Penalty')
+                plt.xlabel('Step')
+                plt.grid(True)
+
+                # 4. Валидность
+                plt.subplot(2, 3, 6)
+                plt.plot(self.history['step'], self.history['mean_valid_100'])
+                plt.title('Validity (last 100)')
+                plt.xlabel('Step')
+                plt.grid(True)
+
                 plt.tight_layout()
                 plt.savefig(os.path.join(self.log_path, "losses.png"))
                 plt.close()

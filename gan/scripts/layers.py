@@ -269,6 +269,10 @@ class TransformerDiscriminator(nn.Module):
             mask = torch.cat([torch.ones(batch_size, 1, dtype=torch.bool, device=emb.device), mask], dim=1)
             
             # Применяем LayerNorm после конкатенации (включая <sos>)
+            emb = torch.where(emb.abs().sum(dim=-1, keepdim=True) == 0, 
+                  torch.full_like(emb, 1e-8), 
+                  emb)
+            emb = torch.nn.functional.normalize(emb, p=2, dim=-1) 
             emb = self.embed_layer_norm(emb)
             
         else:
@@ -280,6 +284,10 @@ class TransformerDiscriminator(nn.Module):
             emb = self.embedding(x)
             
             # Применяем LayerNorm ко всей последовательности (включая <sos>)
+            emb = torch.where(emb.abs().sum(dim=-1, keepdim=True) == 0, 
+                  torch.full_like(emb, 1e-8), 
+                  emb)
+            emb = torch.nn.functional.normalize(emb, p=2, dim=-1) 
             emb = self.embed_layer_norm(emb)
         
         # Позиционное кодирование
@@ -294,3 +302,117 @@ class TransformerDiscriminator(nn.Module):
         seq_repr = masked_out.sum(dim=1) / lengths
         
         return self.critic_head(seq_repr)
+    
+
+
+    import torch
+import torch.nn as nn
+from torch.distributions import Categorical
+
+
+class TransformerGenerator(nn.Module):
+    def __init__(self, latent_dim, vocab_size, max_len, start_token, end_token, num_layers=4, nhead=8, dropout=0.1):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.vocab_size = vocab_size
+        self.max_len = max_len
+        self.start_token = start_token
+        self.end_token = end_token
+
+        # Embeddings
+        self.embedding = nn.Embedding(vocab_size, latent_dim, padding_idx=0)
+        self.pos_encoding = nn.Parameter(torch.randn(1, max_len, latent_dim))
+
+        # Decoder layers
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=latent_dim,
+            nhead=nhead,
+            dim_feedforward=latent_dim * 4,
+            dropout=dropout,
+            batch_first=True,
+            activation="gelu"
+        )
+        self.transformer = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
+
+        # Output
+        self.output_layer = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim * 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(latent_dim * 2, vocab_size)
+        )
+
+        # Project latent vector to initial decoder state
+        self.latent_to_hidden = nn.Linear(latent_dim, latent_dim)
+
+    def forward(self, z, max_len=None):
+        batch_size = z.shape[0]
+        if max_len is None:
+            max_len = self.max_len
+
+        # Initial hidden state from latent vector
+        hidden = self.latent_to_hidden(z).unsqueeze(1)  # [B, 1, H]
+
+        # Start token
+        input_tokens = torch.full((batch_size, 1), self.start_token, device=z.device, dtype=torch.long)
+        outputs = []
+        log_probs = []
+        entropies = []
+
+        for i in range(max_len):
+            # Embed input tokens
+            tgt_emb = self.embedding(input_tokens)  # [B, L, H]
+            tgt_emb = tgt_emb + self.pos_encoding[:, :tgt_emb.size(1), :]
+
+            # Create causal mask
+            # tgt_mask = nn.Transformer.generate_square_subsequent_mask(tgt_emb.size(1), device=z.device)
+            L = tgt_emb.size(1)     
+            tgt_mask = torch.triu(torch.ones(L, L, device=z.device), diagonal=1).bool()
+
+            # Transformer decoder
+            decoder_out = self.transformer(
+                tgt=tgt_emb,
+                memory=hidden,
+                tgt_mask=tgt_mask
+            )  # [B, L, H]
+
+            # Predict next token
+            logits = self.output_layer(decoder_out[:, -1, :])  # only last token
+
+            # Запретить недопустимые токены
+            logits[:, 0] = -1e9  # <pad>
+            logits[:, self.start_token] = -1e9  # <sos>
+            if i < 3:
+                logits[:, self.end_token] = -1e9
+
+            dist = Categorical(logits=logits)
+            sample = dist.sample()
+
+            outputs.append(sample)
+            log_probs.append(dist.log_prob(sample))
+            entropies.append(dist.entropy())
+
+            # Prepare next input
+            input_tokens = torch.cat([input_tokens, sample.unsqueeze(1)], dim=1)
+
+        # Stack outputs
+        x = torch.stack(outputs, dim=1)
+        log_probabilities = torch.stack(log_probs, dim=1)
+        entropies = torch.stack(entropies, dim=1)
+
+        # Обработка длины (оставляем только до <eos>)
+        end_pos = (x == self.end_token).float().argmax(dim=1)
+        seq_lengths = end_pos + 1
+        seq_lengths.masked_fill_(seq_lengths == 1, max_len)
+
+        _x = []
+        _log_probabilities = []
+        _entropies = []
+        for x_i, logp, ent, length in zip(x, log_probabilities, entropies, seq_lengths):
+            _x.append(x_i[:length])
+            _log_probabilities.append(logp[:length])
+            _entropies.append(ent[:length].mean())
+
+        x = torch.nn.utils.rnn.pad_sequence(_x, batch_first=True, padding_value=0)
+
+        return {'x': x, 'log_probabilities': _log_probabilities, 'entropies': _entropies}
